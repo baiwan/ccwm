@@ -1,0 +1,12 @@
+{
+  "name": "ccwm",
+  "version": "1.0.0",
+  "description": "Claude Code multi-session manager via Telegram",
+  "type": "module",
+  "scripts": {
+    "start": "node session-manager.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1"
+  }
+}

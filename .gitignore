@@ -1,0 +1,4 @@
+node_modules/
+.env
+auto-allow-preset.json
+sessions.json
