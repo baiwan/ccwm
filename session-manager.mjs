@@ -2,7 +2,8 @@
 import "dotenv/config";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { writeFile } from "node:fs/promises";
+import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -146,6 +147,83 @@ async function tgTyping(chatId, topicId) {
   const body = { chat_id: chatId, action: "typing" };
   if (topicId) body.message_thread_id = topicId;
   await tgApi("sendChatAction", body).catch(() => {});
+}
+
+// Download a Telegram file to a local path. Returns the local file path.
+async function downloadTgFile(fileId, destDir, filename) {
+  const fileInfo = await tgApi("getFile", { file_id: fileId });
+  if (!fileInfo.ok) throw new Error(`getFile failed: ${JSON.stringify(fileInfo)}`);
+  const filePath = fileInfo.result.file_path;
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const ext = filePath.includes(".") ? "." + filePath.split(".").pop() : "";
+  const localName = filename + ext;
+  const mediaDir = join(destDir, ".ccwm-media");
+  if (!existsSync(mediaDir)) mkdirSync(mediaDir, { recursive: true });
+  const localPath = join(mediaDir, localName);
+  await writeFile(localPath, buf);
+  return localPath;
+}
+
+// Extract media from a Telegram message. Returns { text, files[] } or null.
+async function extractMedia(msg, destDir) {
+  const files = [];
+  const ts = Date.now();
+
+  if (msg.photo?.length) {
+    // Telegram sends multiple sizes; pick the largest
+    const photo = msg.photo[msg.photo.length - 1];
+    const path = await downloadTgFile(photo.file_id, destDir, `photo_${ts}`);
+    files.push({ type: "image", path });
+  }
+
+  if (msg.voice) {
+    const path = await downloadTgFile(msg.voice.file_id, destDir, `voice_${ts}`);
+    files.push({ type: "voice", path, duration: msg.voice.duration });
+  }
+
+  if (msg.audio) {
+    const path = await downloadTgFile(msg.audio.file_id, destDir, `audio_${ts}`);
+    files.push({ type: "audio", path, title: msg.audio.title });
+  }
+
+  if (msg.video) {
+    const path = await downloadTgFile(msg.video.file_id, destDir, `video_${ts}`);
+    files.push({ type: "video", path, duration: msg.video.duration });
+  }
+
+  if (msg.video_note) {
+    const path = await downloadTgFile(msg.video_note.file_id, destDir, `videonote_${ts}`);
+    files.push({ type: "video_note", path, duration: msg.video_note.duration });
+  }
+
+  if (msg.document && !msg.document.mime_type?.startsWith("video/")) {
+    const path = await downloadTgFile(msg.document.file_id, destDir, `doc_${ts}_${msg.document.file_name || "file"}`);
+    files.push({ type: "document", path, name: msg.document.file_name });
+  }
+
+  if (!files.length) return null;
+
+  // Build prompt: caption/text + file references
+  const caption = msg.caption || msg.text || "";
+  const parts = [];
+  if (caption) parts.push(caption);
+  for (const f of files) {
+    if (f.type === "image") {
+      parts.push(`[Image attached — read it at: ${f.path}]`);
+    } else if (f.type === "voice") {
+      parts.push(`[Voice message (${f.duration}s) saved to: ${f.path} — this is an OGG audio file]`);
+    } else if (f.type === "audio") {
+      parts.push(`[Audio file "${f.title || ""}" saved to: ${f.path}]`);
+    } else if (f.type === "video" || f.type === "video_note") {
+      parts.push(`[Video (${f.duration}s) saved to: ${f.path}]`);
+    } else {
+      parts.push(`[File "${f.name || ""}" saved to: ${f.path}]`);
+    }
+  }
+  return { text: parts.join("\n"), files };
 }
 
 // --- Claude Code interaction ------------------------------------------------
@@ -473,17 +551,21 @@ async function poll() {
         }
 
         const msg = update.message;
-        if (!msg?.text) continue;
+        if (!msg) continue;
         if (msg.from.id !== ALLOWED_USER_ID) continue;
         if (msg.chat.id !== CONTROL_CHAT_ID) continue;
 
         const topicId = msg.message_thread_id || null;
-        const text = msg.text.trim();
+
+        // Determine message content (text or media)
+        const hasMedia = msg.photo || msg.voice || msg.audio || msg.video || msg.video_note || msg.document;
+        const rawText = msg.text || msg.caption || "";
+        if (!rawText && !hasMedia) continue;
 
         // --- General topic: handle commands ---
         const isGeneral = !topicId || topicId === 1;
         if (isGeneral) {
-          const cmdMatch = CMD_RE.exec(text);
+          const cmdMatch = CMD_RE.exec(rawText.trim());
           if (cmdMatch) {
             await handleCommand(CONTROL_CHAT_ID, topicId, cmdMatch[1], cmdMatch[2] || "");
           }
@@ -500,10 +582,28 @@ async function poll() {
           continue;
         }
 
+        // Build prompt: download media if present, otherwise use text
+        let promptText;
+        if (hasMedia) {
+          try {
+            const media = await extractMedia(msg, session.workDir);
+            promptText = media ? media.text : rawText.trim();
+          } catch (err) {
+            console.error("Media download error:", err.message);
+            await tgSend(CONTROL_CHAT_ID, `⚠️ Failed to download media: ${err.message}`, topicId);
+            if (!rawText.trim()) continue;
+            promptText = rawText.trim();
+          }
+        } else {
+          promptText = rawText.trim();
+        }
+
+        if (!promptText) continue;
+
         const typingIv = startTypingLoop(CONTROL_CHAT_ID, topicId, session.name);
 
         try {
-          const result = await runClaude(session, text);
+          const result = await runClaude(session, promptText);
 
           // Persist session ID for conversation continuity
           if (result.sessionId && !session.sessionId) {
