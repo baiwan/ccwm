@@ -153,7 +153,24 @@ async function tgTyping(chatId, topicId) {
 const activeProcs = new Map();
 
 // Per-session auto-allow (in addition to preset)
+// Persisted in sessions.json as session.autoAllowed array
 const sessionAutoAllowed = new Map(); // sessionName -> Set of tool names
+
+// Load persisted per-session auto-allows
+for (const s of sessions) {
+  if (Array.isArray(s.autoAllowed) && s.autoAllowed.length) {
+    sessionAutoAllowed.set(s.name, new Set(s.autoAllowed));
+  }
+}
+
+function saveSessionAutoAllowed(sessionName) {
+  const session = sessions.find(s => s.name === sessionName);
+  if (session) {
+    const extra = sessionAutoAllowed.get(sessionName);
+    session.autoAllowed = extra ? [...extra] : [];
+    saveSessions();
+  }
+}
 
 function getEffectiveAllowedTools(sessionName) {
   const extra = sessionAutoAllowed.get(sessionName);
@@ -364,6 +381,7 @@ async function handleCommand(chatId, topicId, command, args) {
         });
       } catch { /* topic might already be gone */ }
 
+      sessionAutoAllowed.delete(name);
       sessions.splice(idx, 1);
       saveSessions();
       await tgSend(chatId, `✅ Session "${name}" removed.`, topicId);
@@ -424,6 +442,7 @@ async function poll() {
               sessionAutoAllowed.set(entry.sessionName, new Set());
             }
             sessionAutoAllowed.get(entry.sessionName).add(entry.toolName);
+            saveSessionAutoAllowed(entry.sessionName);
             pendingPermissions.delete(reaction.message_id);
             await tgSend(CONTROL_CHAT_ID,
               `✅ \`${entry.toolName}\` auto-allowed for session *${entry.sessionName}*.`,
@@ -434,6 +453,7 @@ async function poll() {
               sessionAutoAllowed.set(entry.sessionName, new Set());
             }
             sessionAutoAllowed.get(entry.sessionName).add(entry.pattern);
+            saveSessionAutoAllowed(entry.sessionName);
             pendingPermissions.delete(reaction.message_id);
             await tgSend(CONTROL_CHAT_ID,
               `✅ Pattern \`${entry.pattern}\` auto-allowed for session *${entry.sessionName}*.`,
