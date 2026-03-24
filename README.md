@@ -20,7 +20,7 @@ You (Telegram)  -->  CCWM Bot  -->  Claude Code (per-session)
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USER/ccwm.git
+git clone https://github.com/baiwan/ccwm.git
 cd ccwm
 ./install.sh
 ```
