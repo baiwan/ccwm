@@ -46,6 +46,71 @@ try {
   if (Array.isArray(preset)) allowedTools = preset;
 } catch { /* no preset */ }
 
+function savePreset() {
+  writeFileSync(PRESET_PATH, JSON.stringify(allowedTools, null, 2) + "\n");
+}
+
+function buildPattern(denial) {
+  const tool = denial.toolName;
+  const input = denial.input;
+
+  if (!tool || !input) {
+    return denial.text ? guessPatternFromDenial(denial.text) : (tool || "unknown");
+  }
+
+  // Bash: extract first word of command as prefix
+  if (tool === "Bash" && input.command) {
+    const firstWord = input.command.trim().split(/[\s;|&]/)[0];
+    return `Bash(${firstWord}:*)`;
+  }
+
+  // File tools: extract parent directory
+  if (["Write", "Edit", "Read"].includes(tool) && input.file_path) {
+    const dir = input.file_path.replace(/\/[^/]+$/, "");
+    return `${tool}(${dir}:*)`;
+  }
+
+  return tool;
+}
+
+function guessToolFromDenial(denial) {
+  if (denial.includes("write to") || denial.includes("create")) return "Write";
+  if (denial.includes("edit")) return "Edit";
+  if (denial.includes("read")) return "Read";
+  if (denial.includes("execute") || denial.includes("run")) return "Bash";
+  if (denial.includes("search")) return "WebSearch";
+  if (denial.includes("fetch")) return "WebFetch";
+  // Fallback: try to extract tool name directly
+  const m = denial.match(/use (\w+)/);
+  return m ? m[1] : "unknown";
+}
+
+function guessPatternFromDenial(denial) {
+  const tool = guessToolFromDenial(denial);
+
+  // Try to extract path for file tools
+  if (["Write", "Edit", "Read"].includes(tool)) {
+    const pathMatch = denial.match(/(?:write to|edit|read)\s+(\/\S+)/i);
+    if (pathMatch) {
+      // Use parent directory as pattern: Write(/stuff/baiwan/dev/foo:*)
+      const dir = pathMatch[1].replace(/\/[^/]+$/, "");
+      return `${tool}(${dir}:*)`;
+    }
+  }
+
+  // Try to extract command prefix for Bash
+  if (tool === "Bash") {
+    const cmdMatch = denial.match(/run\s+`([^`\s]+)/i)
+      || denial.match(/execute\s+`([^`\s]+)/i);
+    if (cmdMatch) {
+      return `Bash(${cmdMatch[1]}:*)`;
+    }
+  }
+
+  // Fallback to just the tool name
+  return tool;
+}
+
 // --- Telegram helpers -------------------------------------------------------
 async function tgApi(method, body) {
   const res = await fetch(`${API}/${method}`, {
@@ -87,18 +152,28 @@ async function tgTyping(chatId, topicId) {
 // Active child processes per session name (for cancellation)
 const activeProcs = new Map();
 
+// Per-session auto-allow (in addition to preset)
+const sessionAutoAllowed = new Map(); // sessionName -> Set of tool names
+
+function getEffectiveAllowedTools(sessionName) {
+  const extra = sessionAutoAllowed.get(sessionName);
+  if (!extra?.size) return allowedTools;
+  return [...allowedTools, ...extra];
+}
+
 function runClaude(session, message) {
   return new Promise((resolve, reject) => {
-    const args = ["-p", message, "--output-format", "text", "--verbose"];
+    const effective = getEffectiveAllowedTools(session.name);
+    const args = ["-p", message, "--output-format", "stream-json", "--verbose"];
 
     // Resume conversation if we have a session ID
     if (session.sessionId) {
       args.push("--resume", session.sessionId);
     }
 
-    // Permission mode — auto-allow tools from preset
-    if (allowedTools.length) {
-      args.push("--allowedTools", ...allowedTools);
+    // Permission mode — auto-allow tools from preset + session extras
+    if (effective.length) {
+      args.push("--allowedTools", ...effective);
       args.push("--permission-mode", "auto");
     }
 
@@ -109,22 +184,83 @@ function runClaude(session, message) {
 
     activeProcs.set(session.name, proc);
 
-    let stdout = "";
-    let stderr = "";
+    let buffer = "";
+    let resultText = "";
+    let sessionId = null;
+    const permissionDenials = [];
 
-    proc.stdout.on("data", (d) => { stdout += d; });
+    proc.stdout.on("data", (d) => {
+      buffer += d;
+      // Parse newline-delimited JSON
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+
+          // Extract session ID from init
+          if (event.type === "system" && event.subtype === "init") {
+            sessionId = event.session_id;
+          }
+
+          // Extract session ID and permission denials from result
+          if (event.type === "result") {
+            sessionId = event.session_id || sessionId;
+            resultText = event.result || resultText;
+            // Structured permission denials from result event
+            if (Array.isArray(event.permission_denials)) {
+              for (const d of event.permission_denials) {
+                permissionDenials.push({
+                  toolName: d.tool_name,
+                  input: d.tool_input,
+                  text: `${d.tool_name}: ${JSON.stringify(d.tool_input).slice(0, 200)}`,
+                });
+              }
+            }
+          }
+
+          // Extract text from assistant messages
+          if (event.type === "assistant" && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === "text") {
+                resultText = block.text;
+              }
+            }
+          }
+
+          // Legacy text-based denial detection (fallback)
+          if (event.type === "user" && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.is_error && typeof block.content === "string"
+                  && (block.content.includes("requested permissions")
+                    || block.content.includes("was blocked")
+                    || block.content.includes("haven't granted"))) {
+                // Only add if we don't already have a structured denial for this
+                const toolName = guessToolFromDenial(block.content);
+                if (!permissionDenials.some(d => d.toolName === toolName)) {
+                  permissionDenials.push({ toolName, text: block.content });
+                }
+              }
+            }
+          }
+        } catch { /* skip unparseable lines */ }
+      }
+    });
+
+    let stderr = "";
     proc.stderr.on("data", (d) => { stderr += d; });
 
     proc.on("close", (code) => {
       activeProcs.delete(session.name);
 
-      // Try to extract session ID from stderr (claude prints it there)
-      const sidMatch = stderr.match(/session:\s*([0-9a-f-]{36})/i)
-        || stderr.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-      const newSessionId = sidMatch ? sidMatch[1] : null;
-
-      if (code === 0 || stdout.trim()) {
-        resolve({ response: stdout.trim() || "(empty response)", sessionId: newSessionId });
+      if (code === 0 || resultText) {
+        resolve({
+          response: resultText || "(empty response)",
+          sessionId,
+          permissionDenials,
+        });
       } else {
         reject(new Error(`claude exited ${code}: ${stderr.slice(-500)}`));
       }
@@ -136,6 +272,9 @@ function runClaude(session, message) {
     });
   });
 }
+
+// Pending permission messages: messageId -> { sessionName, toolName }
+const pendingPermissions = new Map();
 
 // --- Typing indicator loop --------------------------------------------------
 // Keeps sending "typing" every 4s while claude is working
@@ -258,14 +397,60 @@ async function poll() {
   while (true) {
     try {
       const res = await fetch(
-        `${API}/getUpdates?offset=${pollOffset}&timeout=30&allowed_updates=${encodeURIComponent(JSON.stringify(["message"]))}`,
+        `${API}/getUpdates?offset=${pollOffset}&timeout=30&allowed_updates=${encodeURIComponent(JSON.stringify(["message", "message_reaction"]))}`,
         { signal: AbortSignal.timeout(35000) }
       );
       const data = await res.json();
       const updates = data.ok ? data.result : [];
 
+      if (updates.length) console.error(`Got ${updates.length} update(s)`);
+
       for (const update of updates) {
         pollOffset = update.update_id + 1;
+        console.error(`Update: ${JSON.stringify(update).slice(0, 200)}`);
+
+        // --- Handle emoji reactions (auto-allow permissions) ---
+        const reaction = update.message_reaction;
+        if (reaction) {
+          if (reaction.user?.id !== ALLOWED_USER_ID) continue;
+          if (reaction.chat.id !== CONTROL_CHAT_ID) continue;
+          const entry = pendingPermissions.get(reaction.message_id);
+          if (!entry) continue;
+
+          const emojis = (reaction.new_reaction || []).map(r => r.emoji);
+          if (emojis.includes("👍")) {
+            // Add exact tool to session auto-allow
+            if (!sessionAutoAllowed.has(entry.sessionName)) {
+              sessionAutoAllowed.set(entry.sessionName, new Set());
+            }
+            sessionAutoAllowed.get(entry.sessionName).add(entry.toolName);
+            pendingPermissions.delete(reaction.message_id);
+            await tgSend(CONTROL_CHAT_ID,
+              `✅ \`${entry.toolName}\` auto-allowed for session *${entry.sessionName}*.`,
+              reaction.message_thread_id);
+          } else if (emojis.includes("❤️")) {
+            // Add pattern to session auto-allow (allow similar)
+            if (!sessionAutoAllowed.has(entry.sessionName)) {
+              sessionAutoAllowed.set(entry.sessionName, new Set());
+            }
+            sessionAutoAllowed.get(entry.sessionName).add(entry.pattern);
+            pendingPermissions.delete(reaction.message_id);
+            await tgSend(CONTROL_CHAT_ID,
+              `✅ Pattern \`${entry.pattern}\` auto-allowed for session *${entry.sessionName}*.`,
+              reaction.message_thread_id);
+          } else if (emojis.includes("🤖")) {
+            // Add pattern to global preset (allow similar, persistent)
+            if (!allowedTools.includes(entry.pattern)) {
+              allowedTools.push(entry.pattern);
+              savePreset();
+            }
+            pendingPermissions.delete(reaction.message_id);
+            await tgSend(CONTROL_CHAT_ID,
+              `✅ Pattern \`${entry.pattern}\` added to global preset.`,
+              reaction.message_thread_id);
+          }
+          continue;
+        }
 
         const msg = update.message;
         if (!msg?.text) continue;
@@ -307,6 +492,22 @@ async function poll() {
           }
 
           await tgSend(CONTROL_CHAT_ID, result.response, topicId);
+
+          // Report permission denials so user can auto-allow
+          for (const denial of result.permissionDenials) {
+            const toolName = denial.toolName || guessToolFromDenial(denial.text || "");
+            const pattern = buildPattern(denial);
+            const preview = denial.text || `${toolName} was denied`;
+            const msgId = await tgSend(CONTROL_CHAT_ID,
+              `⚠️ *Permission denied:* ${preview}\n\n` +
+              `👍 auto-allow \`${toolName}\` (this session)\n` +
+              `❤️ allow similar: \`${pattern}\` (this session)\n` +
+              `🤖 allow similar: \`${pattern}\` (global preset)`,
+              topicId);
+            if (msgId && toolName) {
+              pendingPermissions.set(msgId, { sessionName: session.name, toolName, pattern });
+            }
+          }
         } catch (err) {
           await tgSend(CONTROL_CHAT_ID, `❌ ${err.message}`, topicId);
         } finally {
