@@ -256,7 +256,7 @@ function getEffectiveAllowedTools(sessionName) {
   return [...allowedTools, ...extra];
 }
 
-function runClaude(session, message, { onThinking } = {}) {
+function runClaude(session, message, { onThinking, onToolUse, onToolResult } = {}) {
   return new Promise((resolve, reject) => {
     const effective = getEffectiveAllowedTools(session.name);
     const args = ["-p", message, "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
@@ -322,11 +322,23 @@ function runClaude(session, message, { onThinking } = {}) {
             }
           }
 
-          // Extract text from assistant messages
+          // Extract text and tool_use from assistant messages
           if (event.type === "assistant" && event.message?.content) {
             for (const block of event.message.content) {
               if (block.type === "text") {
                 resultText = block.text;
+              }
+              if (block.type === "tool_use" && onToolUse) {
+                onToolUse(block);
+              }
+            }
+          }
+
+          // Extract tool results from user messages
+          if (event.type === "user" && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === "tool_result" && onToolResult) {
+                onToolResult(block);
               }
             }
           }
@@ -423,7 +435,7 @@ async function handleCommand(chatId, topicId, command, args) {
         mkdirSync(absDir, { recursive: true });
       }
 
-      let newTopicId, thinkingTopicId;
+      let newTopicId, thinkingTopicId, toolTopicId;
       try {
         const res = await tgApi("createForumTopic", {
           chat_id: chatId,
@@ -439,12 +451,20 @@ async function handleCommand(chatId, topicId, command, args) {
         if (res2.ok) {
           thinkingTopicId = res2.result.message_thread_id;
         }
+
+        const res3 = await tgApi("createForumTopic", {
+          chat_id: chatId,
+          name: `🔧 ${name}`,
+        });
+        if (res3.ok) {
+          toolTopicId = res3.result.message_thread_id;
+        }
       } catch (err) {
         await tgSend(chatId, `❌ Failed to create topic: ${err.message}`, topicId);
         return;
       }
 
-      sessions.push({ name, topicId: newTopicId, thinkingTopicId: thinkingTopicId || null, workDir: absDir, sessionId: null });
+      sessions.push({ name, topicId: newTopicId, thinkingTopicId: thinkingTopicId || null, toolTopicId: toolTopicId || null, workDir: absDir, sessionId: null });
       saveSessions();
 
       await tgSend(chatId, `✅ Session *${name}* created.\nDir: \`${absDir}\`\nSend messages in the new topic.`, topicId);
@@ -504,6 +524,107 @@ async function handleCommand(chatId, topicId, command, args) {
     default:
       // Not a known command — ignore (don't forward to claude)
       break;
+  }
+}
+
+// --- Handle a session message (runs concurrently, doesn't block poll) -------
+async function handleSessionMessage(session, topicId, promptText) {
+  const typingIv = startTypingLoop(CONTROL_CHAT_ID, topicId, session.name);
+
+  try {
+    console.error(`Routing to session "${session.name}" (${session.workDir}): ${promptText.slice(0, 100)}`);
+
+    // Stream thinking to the thinking topic if it exists
+    const thinkingTopicId = session.thinkingTopicId;
+    let thinkingBuffer = "";
+    let thinkingFlushTimer = null;
+
+    const flushThinking = async () => {
+      if (!thinkingBuffer || !thinkingTopicId) return;
+      const chunk = thinkingBuffer;
+      thinkingBuffer = "";
+      await tgSend(CONTROL_CHAT_ID, chunk, thinkingTopicId).catch(() => {});
+    };
+
+    const onThinking = thinkingTopicId ? (text) => {
+      thinkingBuffer += text;
+      // Batch thinking output — flush every 2 seconds or at 3000 chars
+      if (thinkingBuffer.length > 3000) {
+        clearTimeout(thinkingFlushTimer);
+        flushThinking();
+      } else if (!thinkingFlushTimer) {
+        thinkingFlushTimer = setTimeout(() => {
+          thinkingFlushTimer = null;
+          flushThinking();
+        }, 2000);
+      }
+    } : undefined;
+
+    // Stream tool activity to the tool topic if it exists
+    const toolTopicId = session.toolTopicId;
+
+    const formatToolInput = (name, input) => {
+      if (!input) return "";
+      if (name === "Bash" && input.command) return `\`${input.command.slice(0, 500)}\``;
+      if (name === "Read" && input.file_path) return `\`${input.file_path}\`${input.offset ? ` (L${input.offset})` : ""}`;
+      if (name === "Write" && input.file_path) return `\`${input.file_path}\``;
+      if (name === "Edit" && input.file_path) return `\`${input.file_path}\``;
+      if (name === "Glob" && input.pattern) return `\`${input.pattern}\``;
+      if (name === "Grep" && input.pattern) return `\`${input.pattern}\`${input.path ? ` in \`${input.path}\`` : ""}`;
+      if (name === "Agent") return input.prompt?.slice(0, 200) || "";
+      return JSON.stringify(input).slice(0, 300);
+    };
+
+    const onToolUse = toolTopicId ? (block) => {
+      const summary = `🔧 *${block.name}*\n${formatToolInput(block.name, block.input)}`;
+      tgSend(CONTROL_CHAT_ID, summary, toolTopicId).catch(() => {});
+    } : undefined;
+
+    const onToolResult = toolTopicId ? (block) => {
+      const content = Array.isArray(block.content)
+        ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("").slice(0, 1000)
+        : (typeof block.content === "string" ? block.content.slice(0, 1000) : "");
+      if (!content) return;
+      const prefix = block.is_error ? "❌" : "✅";
+      tgSend(CONTROL_CHAT_ID, `${prefix} ${content}`, toolTopicId).catch(() => {});
+    } : undefined;
+
+    const result = await runClaude(session, promptText, { onThinking, onToolUse, onToolResult });
+
+    // Flush any remaining thinking
+    clearTimeout(thinkingFlushTimer);
+    await flushThinking();
+
+    console.error(`Claude returned for "${session.name}": ${result.response.slice(0, 100)}`);
+
+    // Persist session ID for conversation continuity
+    if (result.sessionId && !session.sessionId) {
+      session.sessionId = result.sessionId;
+      saveSessions();
+    }
+
+    await tgSend(CONTROL_CHAT_ID, result.response, topicId);
+
+    // Report permission denials so user can auto-allow
+    for (const denial of result.permissionDenials) {
+      const toolName = denial.toolName || guessToolFromDenial(denial.text || "");
+      const pattern = buildPattern(denial);
+      const preview = denial.text || `${toolName} was denied`;
+      const msgId = await tgSend(CONTROL_CHAT_ID,
+        `⚠️ *Permission denied:* ${preview}\n\n` +
+        `👍 auto-allow \`${toolName}\` (this session)\n` +
+        `❤️ allow similar: \`${pattern}\` (this session)\n` +
+        `🤖 allow similar: \`${pattern}\` (global preset)`,
+        topicId);
+      if (msgId && toolName) {
+        pendingPermissions.set(msgId, { sessionName: session.name, toolName, pattern });
+      }
+    }
+  } catch (err) {
+    console.error(`Error in session "${session.name}":`, err.message);
+    await tgSend(CONTROL_CHAT_ID, `❌ ${err.message}`, topicId);
+  } finally {
+    clearInterval(typingIv);
   }
 }
 
@@ -625,74 +746,8 @@ async function poll() {
 
         if (!promptText) continue;
 
-        const typingIv = startTypingLoop(CONTROL_CHAT_ID, topicId, session.name);
-
-        try {
-          console.error(`Routing to session "${session.name}" (${session.workDir}): ${promptText.slice(0, 100)}`);
-
-          // Stream thinking to the thinking topic if it exists
-          const thinkingTopicId = session.thinkingTopicId;
-          let thinkingBuffer = "";
-          let thinkingFlushTimer = null;
-
-          const flushThinking = async () => {
-            if (!thinkingBuffer || !thinkingTopicId) return;
-            const chunk = thinkingBuffer;
-            thinkingBuffer = "";
-            await tgSend(CONTROL_CHAT_ID, chunk, thinkingTopicId).catch(() => {});
-          };
-
-          const onThinking = thinkingTopicId ? (text) => {
-            thinkingBuffer += text;
-            // Batch thinking output — flush every 2 seconds or at 3000 chars
-            if (thinkingBuffer.length > 3000) {
-              clearTimeout(thinkingFlushTimer);
-              flushThinking();
-            } else if (!thinkingFlushTimer) {
-              thinkingFlushTimer = setTimeout(() => {
-                thinkingFlushTimer = null;
-                flushThinking();
-              }, 2000);
-            }
-          } : undefined;
-
-          const result = await runClaude(session, promptText, { onThinking });
-
-          // Flush any remaining thinking
-          clearTimeout(thinkingFlushTimer);
-          await flushThinking();
-
-          console.error(`Claude returned for "${session.name}": ${result.response.slice(0, 100)}`);
-
-          // Persist session ID for conversation continuity
-          if (result.sessionId && !session.sessionId) {
-            session.sessionId = result.sessionId;
-            saveSessions();
-          }
-
-          await tgSend(CONTROL_CHAT_ID, result.response, topicId);
-
-          // Report permission denials so user can auto-allow
-          for (const denial of result.permissionDenials) {
-            const toolName = denial.toolName || guessToolFromDenial(denial.text || "");
-            const pattern = buildPattern(denial);
-            const preview = denial.text || `${toolName} was denied`;
-            const msgId = await tgSend(CONTROL_CHAT_ID,
-              `⚠️ *Permission denied:* ${preview}\n\n` +
-              `👍 auto-allow \`${toolName}\` (this session)\n` +
-              `❤️ allow similar: \`${pattern}\` (this session)\n` +
-              `🤖 allow similar: \`${pattern}\` (global preset)`,
-              topicId);
-            if (msgId && toolName) {
-              pendingPermissions.set(msgId, { sessionName: session.name, toolName, pattern });
-            }
-          }
-        } catch (err) {
-          console.error(`Error in session "${session.name}":`, err.message);
-          await tgSend(CONTROL_CHAT_ID, `❌ ${err.message}`, topicId);
-        } finally {
-          clearInterval(typingIv);
-        }
+        // Fire and forget — don't block the poll loop
+        handleSessionMessage(session, topicId, promptText);
       }
     } catch (err) {
       console.error("Poll error:", err.message);
@@ -700,4 +755,34 @@ async function poll() {
   }
 }
 
-poll();
+// Backfill missing topics for existing sessions
+async function backfillTopics() {
+  let changed = false;
+  for (const session of sessions) {
+    if (!session.toolTopicId) {
+      const res = await tgApi("createForumTopic", {
+        chat_id: CONTROL_CHAT_ID,
+        name: `🔧 ${session.name}`,
+      });
+      if (res.ok) {
+        session.toolTopicId = res.result.message_thread_id;
+        changed = true;
+        console.error(`Created tool topic for "${session.name}"`);
+      }
+    }
+    if (!session.thinkingTopicId) {
+      const res = await tgApi("createForumTopic", {
+        chat_id: CONTROL_CHAT_ID,
+        name: `🧠 ${session.name}`,
+      });
+      if (res.ok) {
+        session.thinkingTopicId = res.result.message_thread_id;
+        changed = true;
+        console.error(`Created thinking topic for "${session.name}"`);
+      }
+    }
+  }
+  if (changed) saveSessions();
+}
+
+backfillTopics().then(() => poll());
