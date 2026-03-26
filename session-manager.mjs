@@ -326,7 +326,7 @@ function runClaude(session, message, { onThinking, onToolUse, onToolResult } = {
           if (event.type === "assistant" && event.message?.content) {
             for (const block of event.message.content) {
               if (block.type === "text") {
-                resultText = block.text;
+                resultText += (resultText ? "\n\n" : "") + block.text;
               }
               if (block.type === "tool_use" && onToolUse) {
                 onToolUse(block);
