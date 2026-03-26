@@ -1,4 +1,4 @@
-# CCWM - Claude Code Workstation Manager
+# CCWM - Claude Code Worker Multi
 
 Control multiple Claude Code sessions remotely through Telegram.
 
