@@ -256,10 +256,10 @@ function getEffectiveAllowedTools(sessionName) {
   return [...allowedTools, ...extra];
 }
 
-function runClaude(session, message) {
+function runClaude(session, message, { onThinking } = {}) {
   return new Promise((resolve, reject) => {
     const effective = getEffectiveAllowedTools(session.name);
-    const args = ["-p", message, "--output-format", "stream-json", "--verbose"];
+    const args = ["-p", message, "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
 
     // Resume conversation if we have a session ID
     if (session.sessionId) {
@@ -283,6 +283,12 @@ function runClaude(session, message) {
     let resultText = "";
     let sessionId = null;
     const permissionDenials = [];
+
+    // Timeout: kill after 5 minutes and return whatever we have
+    const timeout = setTimeout(() => {
+      console.error(`Timeout for session "${session.name}" — killing claude process`);
+      proc.kill();
+    }, 5 * 60 * 1000);
 
     proc.stdout.on("data", (d) => {
       buffer += d;
@@ -325,6 +331,14 @@ function runClaude(session, message) {
             }
           }
 
+          // Stream thinking from stream_event deltas
+          if (event.type === "stream_event" && event.event) {
+            const se = event.event;
+            if (se.type === "content_block_delta" && se.delta?.type === "thinking_delta" && onThinking) {
+              onThinking(se.delta.thinking);
+            }
+          }
+
           // Legacy text-based denial detection (fallback)
           if (event.type === "user" && event.message?.content) {
             for (const block of event.message.content) {
@@ -348,6 +362,7 @@ function runClaude(session, message) {
     proc.stderr.on("data", (d) => { stderr += d; });
 
     proc.on("close", (code) => {
+      clearTimeout(timeout);
       activeProcs.delete(session.name);
 
       if (code === 0 || resultText) {
@@ -362,6 +377,7 @@ function runClaude(session, message) {
     });
 
     proc.on("error", (err) => {
+      clearTimeout(timeout);
       activeProcs.delete(session.name);
       reject(err);
     });
@@ -407,7 +423,7 @@ async function handleCommand(chatId, topicId, command, args) {
         mkdirSync(absDir, { recursive: true });
       }
 
-      let newTopicId;
+      let newTopicId, thinkingTopicId;
       try {
         const res = await tgApi("createForumTopic", {
           chat_id: chatId,
@@ -415,12 +431,20 @@ async function handleCommand(chatId, topicId, command, args) {
         });
         if (!res.ok) throw new Error(JSON.stringify(res));
         newTopicId = res.result.message_thread_id;
+
+        const res2 = await tgApi("createForumTopic", {
+          chat_id: chatId,
+          name: `🧠 ${name}`,
+        });
+        if (res2.ok) {
+          thinkingTopicId = res2.result.message_thread_id;
+        }
       } catch (err) {
         await tgSend(chatId, `❌ Failed to create topic: ${err.message}`, topicId);
         return;
       }
 
-      sessions.push({ name, topicId: newTopicId, workDir: absDir, sessionId: null });
+      sessions.push({ name, topicId: newTopicId, thinkingTopicId: thinkingTopicId || null, workDir: absDir, sessionId: null });
       saveSessions();
 
       await tgSend(chatId, `✅ Session *${name}* created.\nDir: \`${absDir}\`\nSend messages in the new topic.`, topicId);
@@ -503,7 +527,7 @@ async function poll() {
 
       for (const update of updates) {
         pollOffset = update.update_id + 1;
-        console.error(`Update: ${JSON.stringify(update).slice(0, 200)}`);
+        console.error(`Update: ${JSON.stringify(update).slice(0, 500)}`);
 
         // --- Handle emoji reactions (auto-allow permissions) ---
         const reaction = update.message_reaction;
@@ -514,7 +538,8 @@ async function poll() {
           if (!entry) continue;
 
           const emojis = (reaction.new_reaction || []).map(r => r.emoji);
-          if (emojis.includes("👍")) {
+          const hasEmoji = (e) => emojis.some(em => em.replace(/\uFE0F/g, "") === e.replace(/\uFE0F/g, ""));
+          if (hasEmoji("👍")) {
             // Add exact tool to session auto-allow
             if (!sessionAutoAllowed.has(entry.sessionName)) {
               sessionAutoAllowed.set(entry.sessionName, new Set());
@@ -525,7 +550,7 @@ async function poll() {
             await tgSend(CONTROL_CHAT_ID,
               `✅ \`${entry.toolName}\` auto-allowed for session *${entry.sessionName}*.`,
               reaction.message_thread_id);
-          } else if (emojis.includes("❤️")) {
+          } else if (hasEmoji("❤️") || hasEmoji("❤")) {
             // Add pattern to session auto-allow (allow similar)
             if (!sessionAutoAllowed.has(entry.sessionName)) {
               sessionAutoAllowed.set(entry.sessionName, new Set());
@@ -536,7 +561,7 @@ async function poll() {
             await tgSend(CONTROL_CHAT_ID,
               `✅ Pattern \`${entry.pattern}\` auto-allowed for session *${entry.sessionName}*.`,
               reaction.message_thread_id);
-          } else if (emojis.includes("🤖")) {
+          } else if (hasEmoji("🤖")) {
             // Add pattern to global preset (allow similar, persistent)
             if (!allowedTools.includes(entry.pattern)) {
               allowedTools.push(entry.pattern);
@@ -603,7 +628,41 @@ async function poll() {
         const typingIv = startTypingLoop(CONTROL_CHAT_ID, topicId, session.name);
 
         try {
-          const result = await runClaude(session, promptText);
+          console.error(`Routing to session "${session.name}" (${session.workDir}): ${promptText.slice(0, 100)}`);
+
+          // Stream thinking to the thinking topic if it exists
+          const thinkingTopicId = session.thinkingTopicId;
+          let thinkingBuffer = "";
+          let thinkingFlushTimer = null;
+
+          const flushThinking = async () => {
+            if (!thinkingBuffer || !thinkingTopicId) return;
+            const chunk = thinkingBuffer;
+            thinkingBuffer = "";
+            await tgSend(CONTROL_CHAT_ID, chunk, thinkingTopicId).catch(() => {});
+          };
+
+          const onThinking = thinkingTopicId ? (text) => {
+            thinkingBuffer += text;
+            // Batch thinking output — flush every 2 seconds or at 3000 chars
+            if (thinkingBuffer.length > 3000) {
+              clearTimeout(thinkingFlushTimer);
+              flushThinking();
+            } else if (!thinkingFlushTimer) {
+              thinkingFlushTimer = setTimeout(() => {
+                thinkingFlushTimer = null;
+                flushThinking();
+              }, 2000);
+            }
+          } : undefined;
+
+          const result = await runClaude(session, promptText, { onThinking });
+
+          // Flush any remaining thinking
+          clearTimeout(thinkingFlushTimer);
+          await flushThinking();
+
+          console.error(`Claude returned for "${session.name}": ${result.response.slice(0, 100)}`);
 
           // Persist session ID for conversation continuity
           if (result.sessionId && !session.sessionId) {
@@ -629,6 +688,7 @@ async function poll() {
             }
           }
         } catch (err) {
+          console.error(`Error in session "${session.name}":`, err.message);
           await tgSend(CONTROL_CHAT_ID, `❌ ${err.message}`, topicId);
         } finally {
           clearInterval(typingIv);
