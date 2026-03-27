@@ -143,6 +143,22 @@ async function tgSend(chatId, text, topicId) {
   return lastMessageId;
 }
 
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"]);
+
+async function tgSendPhoto(chatId, filePath, topicId, caption) {
+  const { createReadStream } = await import("node:fs");
+  const FormData = (await import("node:buffer")).File ? null : null; // node 18+ has global FormData
+  const form = new globalThis.FormData();
+  const blob = new Blob([readFileSync(filePath)]);
+  const filename = filePath.split("/").pop();
+  form.append("chat_id", String(chatId));
+  form.append("photo", blob, filename);
+  if (topicId) form.append("message_thread_id", String(topicId));
+  if (caption) form.append("caption", caption.slice(0, 1024));
+  const res = await fetch(`${API}/sendPhoto`, { method: "POST", body: form });
+  return res.json();
+}
+
 async function tgTyping(chatId, topicId) {
   const body = { chat_id: chatId, action: "typing" };
   if (topicId) body.message_thread_id = topicId;
@@ -575,19 +591,59 @@ async function handleSessionMessage(session, topicId, promptText) {
       return JSON.stringify(input).slice(0, 300);
     };
 
-    const onToolUse = toolTopicId ? (block) => {
-      const summary = `🔧 *${block.name}*\n${formatToolInput(block.name, block.input)}`;
-      tgSend(CONTROL_CHAT_ID, summary, toolTopicId).catch(() => {});
-    } : undefined;
+    // Track pending tool calls so we can detect image writes
+    const pendingTools = new Map(); // tool_use_id -> block
 
-    const onToolResult = toolTopicId ? (block) => {
-      const content = Array.isArray(block.content)
-        ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("").slice(0, 1000)
-        : (typeof block.content === "string" ? block.content.slice(0, 1000) : "");
-      if (!content) return;
-      const prefix = block.is_error ? "❌" : "✅";
-      tgSend(CONTROL_CHAT_ID, `${prefix} ${content}`, toolTopicId).catch(() => {});
-    } : undefined;
+    const onToolUse = (block) => {
+      pendingTools.set(block.id, block);
+      if (toolTopicId) {
+        const summary = `🔧 *${block.name}*\n${formatToolInput(block.name, block.input)}`;
+        tgSend(CONTROL_CHAT_ID, summary, toolTopicId).catch(() => {});
+      }
+
+      // If Write targets an image file, send it as a photo after a short delay
+      if (block.name === "Write" && block.input?.file_path) {
+        const ext = "." + block.input.file_path.split(".").pop().toLowerCase();
+        if (IMAGE_EXTS.has(ext)) {
+          // Delay to let the file be written
+          setTimeout(() => {
+            if (existsSync(block.input.file_path)) {
+              tgSendPhoto(CONTROL_CHAT_ID, block.input.file_path, topicId, block.input.file_path.split("/").pop())
+                .catch(() => {});
+            }
+          }, 1000);
+        }
+      }
+    };
+
+    const onToolResult = (block) => {
+      const toolCall = pendingTools.get(block.tool_use_id);
+
+      if (toolTopicId) {
+        const content = Array.isArray(block.content)
+          ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("").slice(0, 1000)
+          : (typeof block.content === "string" ? block.content.slice(0, 1000) : "");
+        if (content) {
+          const prefix = block.is_error ? "❌" : "✅";
+          tgSend(CONTROL_CHAT_ID, `${prefix} ${content}`, toolTopicId).catch(() => {});
+        }
+      }
+
+      // Check if a Bash command produced an image file — look for image paths in output
+      if (toolCall?.name === "Bash" && !block.is_error) {
+        const resultText = Array.isArray(block.content)
+          ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("")
+          : (typeof block.content === "string" ? block.content : "");
+        const pathMatch = resultText.match(/\/?(?:[\w./-]+\/)*[\w.-]+\.(?:png|jpg|jpeg|gif|webp)/i);
+        if (pathMatch) {
+          const imgPath = resolve(session.workDir, pathMatch[0]);
+          if (existsSync(imgPath)) {
+            tgSendPhoto(CONTROL_CHAT_ID, imgPath, topicId, imgPath.split("/").pop())
+              .catch(() => {});
+          }
+        }
+      }
+    };
 
     const result = await runClaude(session, promptText, { onThinking, onToolUse, onToolResult });
 
