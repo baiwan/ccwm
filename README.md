@@ -11,6 +11,8 @@ You (Telegram)  -->  CCWM Bot  -->  Claude Code (per-session)
     topic C                          /home/scripts
 ```
 
+![CCWM demo](example.gif)
+
 ## Requirements
 
 - **Node.js** >= 18
