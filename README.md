@@ -72,11 +72,32 @@ All commands are sent in the **General** topic of your control chat:
 
 This creates a new topic called "myapp". Switch to that topic and start chatting with Claude — it works in `/home/user/projects/myapp` and remembers the conversation.
 
+## Features
+
+- **Multi-session management** — multiple concurrent Claude sessions, each with its own workspace
+- **Conversation continuity** — sessions persist across restarts via session IDs
+- **Streaming visibility** — each session gets three Telegram topics:
+  - `🤖 <name>` — main chat (messages and responses)
+  - `🧠 <name>` — extended thinking output
+  - `🔧 <name>` — tool activity (file reads, edits, bash commands, etc.)
+- **Permission management via emoji reactions** — when Claude gets a permission denial:
+  - 👍 auto-allow the exact tool (this session)
+  - ❤️ auto-allow a pattern (this session)
+  - 🤖 auto-allow a pattern (global preset, persistent)
+- **Media support** — send images, voice, video, and documents to Claude via Telegram
+- **Image forwarding** — when Claude generates or references images, they're sent inline as photos
+- **Concurrent sessions** — work with multiple agents simultaneously without blocking
+- **5-minute timeout** — prevents hung sessions from blocking indefinitely
+
 ## Auto-Allowed Tools
 
 Sessions auto-allow these Claude Code tools (configurable in `auto-allow-preset.json`):
 
 `Edit` `Write` `Read` `Glob` `Grep` `WebFetch` `WebSearch`
+
+## Running Multiple Instances
+
+To run separate CCWM instances for different projects/groups, create a new directory with a copy of the code and a different `.env` pointing to a **different bot token** and **different supergroup**. Each instance needs its own bot since Telegram's `getUpdates` polling only supports one consumer per token.
 
 ## Running as a Service
 
